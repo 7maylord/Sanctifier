@@ -3,7 +3,7 @@ use colored::*;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::fs;
-use sanctifier_core::{Analyzer, CustomRule, CustomRuleMatch, ArithmeticIssue, SizeWarning, UnsafePattern, PatternType};
+
 
 #[derive(Parser)]
 #[command(name = "sanctifier")]
@@ -65,9 +65,7 @@ fn main() {
                 println!("{} Analyzing contract at {:?}...", "🔍".blue(), path);
             }
             
-            let config = load_config(path);
-            let mut analyzer = Analyzer::new(false);
-            analyzer.ledger_limit = *limit;
+
             
             let mut all_size_warnings: Vec<SizeWarning> = Vec::new();
             let mut all_unsafe_patterns: Vec<UnsafePattern> = Vec::new();
@@ -128,9 +126,7 @@ fn main() {
                 });
                 println!("{}", serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string()));
             } else {
-                if !all_size_warnings.is_empty() {
-                    println!("\n{} Found potential Ledger Size Issues!", "📦".yellow());
-                    for warning in all_size_warnings {
+
                         println!(
                             "   {} Warning: Struct {} is approaching ledger entry size limit!",
                             "⚠️".yellow(),
@@ -202,7 +198,8 @@ fn main() {
                     println!("\nNo custom rule matches found.");
                 }
             }
-        },
+        }
+    },
         Commands::Report { output } => {
             println!("{} Generating report...", "📄".yellow());
             if let Some(p) = output {
@@ -212,28 +209,7 @@ fn main() {
             }
         },
         Commands::Init => {
-            let config_path = Path::new(".sanctify.toml");
-            if config_path.exists() {
-                println!("{} .sanctify.toml already exists.", "✅".green());
-                return;
-            }
 
-            let default_config = r#"
-# Sanctifier Configuration
-# ------------------------
-# Define custom rules for the static analyzer.
-# Each rule has a name, a regex pattern, and a description.
-
-[[rules]]
-name = "no-vec"
-pattern = "Vec<"
-description = "Discourage the use of `Vec` in favor of `Map` or other bounded data structures."
-
-"#;
-            if fs::write(config_path, default_config).is_ok() {
-                println!("{} Created default .sanctify.toml configuration.", "⚙️".cyan());
-            } else {
-                eprintln!("{} Failed to create .sanctify.toml.", "❌".red());
             }
         }
     }
@@ -292,7 +268,7 @@ fn analyze_directory(
             } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
                 if let Ok(content) = fs::read_to_string(&path) {
                     let warnings = analyzer.analyze_ledger_size(&content);
-                    all_size_warnings.extend(warnings);
+
 
                     let gaps = analyzer.scan_auth_gaps(&content);
                     for g in gaps {
