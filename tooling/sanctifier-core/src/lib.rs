@@ -3,6 +3,14 @@ use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{parse_str, Fields, File, Item, Meta, Type};
+use soroban_sdk::Env;
+use syn::{parse_str, File, Item, Type, Fields, Meta, ExprMethodCall, Macro};
+use syn::visit::{self, Visit};
+use syn::spanned::Spanned;
+use serde::{Serialize, Deserialize};
+use serde::Serialize;
+use std::collections::HashSet;
+use thiserror::Error;
 
 // ── Existing types ────────────────────────────────────────────────────────────
 
@@ -51,19 +59,41 @@ pub struct ArithmeticIssue {
     pub location: String,
 }
 
+// ── Configuration ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SanctifyConfig {
+    pub ignore_paths: Vec<String>,
+    pub enabled_rules: Vec<String>,
+    pub ledger_limit: usize,
+    pub strict_mode: bool,
+}
+
+impl Default for SanctifyConfig {
+    fn default() -> Self {
+        Self {
+            ignore_paths: vec!["target".to_string(), ".git".to_string()],
+            enabled_rules: vec![
+                "auth_gaps".to_string(),
+                "panics".to_string(),
+                "arithmetic".to_string(),
+                "ledger_size".to_string(),
+            ],
+            ledger_limit: 64000,
+            strict_mode: false,
+        }
+    }
+}
+
 // ── Analyzer ──────────────────────────────────────────────────────────────────
 
 pub struct Analyzer {
-    pub strict_mode: bool,
-    pub ledger_limit: usize,
+    pub config: SanctifyConfig,
 }
 
 impl Analyzer {
-    pub fn new(strict_mode: bool) -> Self {
-        Self {
-            strict_mode,
-            ledger_limit: 64000, // Default 64 KB warning threshold
-        }
+    pub fn new(config: SanctifyConfig) -> Self {
+        Self { config }
     }
 
     pub fn scan_auth_gaps(&self, source: &str) -> Vec<String> {
@@ -90,6 +120,22 @@ impl Analyzer {
             }
         }
 
+        for item in file.items {
+            if let Item::Impl(i) = item {
+                for impl_item in &i.items {
+                    if let syn::ImplItem::Fn(f) = impl_item {
+                        if let syn::Visibility::Public(_) = f.vis {
+                            let mut has_mutation = false;
+                            let mut has_auth = false;
+                            self.check_fn_body(&f.block, &mut has_mutation, &mut has_auth);
+                            if has_mutation && !has_auth {
+                                gaps.push(f.sig.ident.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         gaps
     }
 
@@ -203,6 +249,11 @@ impl Analyzer {
                         self.check_expr(&init.expr, has_mutation, has_auth);
                     }
                 }
+                syn::Stmt::Macro(m) => {
+                    if m.mac.path.is_ident("require_auth") || m.mac.path.is_ident("require_auth_for_args") {
+                        *has_auth = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -228,7 +279,7 @@ impl Analyzer {
                 if method_name == "set" || method_name == "update" || method_name == "remove" {
                     // Heuristic: check if receiver chain contains "storage"
                     let receiver_str = quote::quote!(#m.receiver).to_string();
-                    if receiver_str.contains("storage") {
+                    if receiver_str.contains("storage") || receiver_str.contains("persistent") || receiver_str.contains("temporary") || receiver_str.contains("instance") {
                         *has_mutation = true;
                     }
                 }
@@ -280,18 +331,22 @@ impl Analyzer {
             match item {
                 Item::Struct(s) => {
                     let has_contracttype = s.attrs.iter().any(|attr| {
-                        matches!(&attr.meta, Meta::Path(path) if path.is_ident("contracttype"))
+                        if let Meta::Path(path) = &attr.meta {
+                            path.is_ident("contracttype") || path.segments.iter().any(|s| s.ident == "contracttype")
+                        } else {
+                            false
+                        }
                     });
 
                     if has_contracttype {
                         let size = self.estimate_struct_size(&s);
-                        if size > self.ledger_limit
-                            || (self.strict_mode && size > self.ledger_limit / 2)
+                        if size > self.config.ledger_limit
+                            || (self.config.strict_mode && size > self.config.ledger_limit / 2)
                         {
                             warnings.push(SizeWarning {
                                 struct_name: s.ident.to_string(),
                                 estimated_size: size,
-                                limit: self.ledger_limit,
+                                limit: self.config.ledger_limit,
                             });
                         }
                     }
@@ -394,10 +449,40 @@ struct UnsafeVisitor {
 }
 
 impl<'ast> Visit<'ast> for UnsafeVisitor {
-    fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
-        if node.mac.path.is_ident("panic") {
+    fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
+        let method_name = i.method.to_string();
+        if method_name == "unwrap" || method_name == "expect" {
+            let pattern_type = if method_name == "unwrap" {
+                PatternType::Unwrap
+            } else {
+                PatternType::Expect
+            };
+            self.patterns.push(UnsafePattern {
+                pattern_type,
+                snippet: quote::quote!(#i).to_string(),
+                line: 0, // Simplified for now
+            });
+        }
+        visit::visit_expr_method_call(self, i);
+    }
+
+    fn visit_expr_macro(&mut self, i: &'ast syn::ExprMacro) {
+        if i.mac.path.is_ident("panic") {
+            self.patterns.push(UnsafePattern {
+                pattern_type: PatternType::Panic,
+                snippet: quote::quote!(#i).to_string(),
+                line: 0,
+            });
+        }
+        visit::visit_expr_macro(self, i);
+    }
+}
+
+pub trait SanctifiedGuard {
+    fn check_invariant(&self, env: &Env) -> Result<(), String>;
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if node.path.is_ident("panic") {
             let line = node
-                .mac
                 .path
                 .get_ident()
                 .map(|i| i.span().start().line)
@@ -408,7 +493,7 @@ impl<'ast> Visit<'ast> for UnsafeVisitor {
                 snippet: "panic!()".to_string(),
             });
         }
-        visit::visit_expr_macro(self, node);
+        visit::visit_macro(self, node);
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
@@ -543,7 +628,7 @@ mod tests {
 
     #[test]
     fn test_analyze_with_macros() {
-        let analyzer = Analyzer::new(false);
+        let analyzer = Analyzer::new(SanctifyConfig::default());
         let source = r#"
             use soroban_sdk::{contract, contractimpl, Env};
 
@@ -573,8 +658,9 @@ mod tests {
 
     #[test]
     fn test_analyze_with_limit() {
-        let mut analyzer = Analyzer::new(false);
-        analyzer.ledger_limit = 50;
+        let mut config = SanctifyConfig::default();
+        config.ledger_limit = 50;
+        let analyzer = Analyzer::new(config);
         let source = r#"
             #[contracttype]
             pub struct ExceedsLimit {
@@ -589,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_complex_macro_no_panic() {
-        let analyzer = Analyzer::new(false);
+        let analyzer = Analyzer::new(SanctifyConfig::default());
         let source = r#"
             macro_rules! complex {
                 ($($t:tt)*) => { $($t)* };
@@ -614,7 +700,7 @@ mod tests {
 
     #[test]
     fn test_scan_auth_gaps() {
-        let analyzer = Analyzer::new(false);
+        let analyzer = Analyzer::new(SanctifyConfig::default());
         let source = r#"
             #[contractimpl]
             impl MyContract {
@@ -643,7 +729,7 @@ mod tests {
 
     #[test]
     fn test_scan_panics() {
-        let analyzer = Analyzer::new(false);
+        let analyzer = Analyzer::new(SanctifyConfig::default());
         let source = r#"
             #[contractimpl]
             impl MyContract {
@@ -679,7 +765,7 @@ mod tests {
 
     #[test]
     fn test_scan_arithmetic_overflow_basic() {
-        let analyzer = Analyzer::new(false);
+        let analyzer = Analyzer::new(SanctifyConfig::default());
         let source = r#"
             #[contractimpl]
             impl MyContract {
@@ -715,7 +801,7 @@ mod tests {
 
     #[test]
     fn test_scan_arithmetic_overflow_compound_assign() {
-        let analyzer = Analyzer::new(false);
+        let analyzer = Analyzer::new(SanctifyConfig::default());
         let source = r#"
             #[contractimpl]
             impl Token {
@@ -738,7 +824,7 @@ mod tests {
 
     #[test]
     fn test_scan_arithmetic_overflow_deduplication() {
-        let analyzer = Analyzer::new(false);
+        let analyzer = Analyzer::new(SanctifyConfig::default());
         let source = r#"
             #[contractimpl]
             impl MyContract {
@@ -756,7 +842,7 @@ mod tests {
 
     #[test]
     fn test_scan_arithmetic_overflow_no_false_positive_safe_code() {
-        let analyzer = Analyzer::new(false);
+        let analyzer = Analyzer::new(SanctifyConfig::default());
         let source = r#"
             #[contractimpl]
             impl MyContract {
@@ -779,7 +865,7 @@ mod tests {
 
     #[test]
     fn test_scan_arithmetic_overflow_custom_wrapper_types() {
-        let analyzer = Analyzer::new(false);
+        let analyzer = Analyzer::new(SanctifyConfig::default());
         // Custom type wrapping a primitive — arithmetic on it is still flagged
         let source = r#"
             #[contractimpl]
@@ -796,7 +882,7 @@ mod tests {
 
     #[test]
     fn test_scan_arithmetic_overflow_suggestion_content() {
-        let analyzer = Analyzer::new(false);
+        let analyzer = Analyzer::new(SanctifyConfig::default());
         let source = r#"
             #[contractimpl]
             impl MyContract {
