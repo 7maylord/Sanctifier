@@ -1,16 +1,9 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{parse_str, Fields, File, Item, Meta, Type};
 use soroban_sdk::Env;
-use syn::{parse_str, File, Item, Type, Fields, Meta, ExprMethodCall, Macro};
-use syn::visit::{self, Visit};
-use syn::spanned::Spanned;
-use serde::{Serialize, Deserialize};
-use serde::Serialize;
-use std::collections::HashSet;
-use thiserror::Error;
 
 // ── Existing types ────────────────────────────────────────────────────────────
 
@@ -61,26 +54,60 @@ pub struct ArithmeticIssue {
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
+/// User-defined regex-based rule. Defined in .sanctify.toml under [[custom_rules]].
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CustomRule {
+    pub name: String,
+    pub pattern: String,
+}
+
+/// A match from a custom regex rule.
+#[derive(Debug, Serialize, Clone)]
+pub struct CustomRuleMatch {
+    pub rule_name: String,
+    pub line: usize,
+    pub snippet: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SanctifyConfig {
+    #[serde(default = "default_ignore_paths")]
     pub ignore_paths: Vec<String>,
+    #[serde(default = "default_enabled_rules")]
     pub enabled_rules: Vec<String>,
+    #[serde(default = "default_ledger_limit")]
     pub ledger_limit: usize,
+    #[serde(default)]
     pub strict_mode: bool,
+    #[serde(default)]
+    pub custom_rules: Vec<CustomRule>,
+}
+
+fn default_ignore_paths() -> Vec<String> {
+    vec!["target".to_string(), ".git".to_string()]
+}
+
+fn default_enabled_rules() -> Vec<String> {
+    vec![
+        "auth_gaps".to_string(),
+        "panics".to_string(),
+        "arithmetic".to_string(),
+        "ledger_size".to_string(),
+    ]
+}
+
+fn default_ledger_limit() -> usize {
+    64000
 }
 
 impl Default for SanctifyConfig {
     fn default() -> Self {
         Self {
-            ignore_paths: vec!["target".to_string(), ".git".to_string()],
-            enabled_rules: vec![
-                "auth_gaps".to_string(),
-                "panics".to_string(),
-                "arithmetic".to_string(),
-                "ledger_size".to_string(),
-            ],
-            ledger_limit: 64000,
+            ignore_paths: default_ignore_paths(),
+            enabled_rules: default_enabled_rules(),
+            ledger_limit: default_ledger_limit(),
             strict_mode: false,
+            custom_rules: vec![],
         }
     }
 }
@@ -104,32 +131,17 @@ impl Analyzer {
 
         let mut gaps = Vec::new();
 
-        for item in file.items {
-            if let Item::Impl(i) = item {
-                for impl_item in &i.items {
-                    if let syn::ImplItem::Fn(f) = impl_item {
-                        let fn_name = f.sig.ident.to_string();
-                        let mut has_mutation = false;
-                        let mut has_auth = false;
-                        self.check_fn_body(&f.block, &mut has_mutation, &mut has_auth);
-                        if has_mutation && !has_auth {
-                            gaps.push(fn_name);
-                        }
-                    }
-                }
-            }
-        }
-
-        for item in file.items {
+        for item in &file.items {
             if let Item::Impl(i) = item {
                 for impl_item in &i.items {
                     if let syn::ImplItem::Fn(f) = impl_item {
                         if let syn::Visibility::Public(_) = f.vis {
+                            let fn_name = f.sig.ident.to_string();
                             let mut has_mutation = false;
                             let mut has_auth = false;
                             self.check_fn_body(&f.block, &mut has_mutation, &mut has_auth);
                             if has_mutation && !has_auth {
-                                gaps.push(f.sig.ident.to_string());
+                                gaps.push(fn_name);
                             }
                         }
                     }
@@ -400,6 +412,30 @@ impl Analyzer {
         visitor.issues
     }
 
+    /// Run regex-based custom rules from config. Returns matches with line and snippet.
+    pub fn analyze_custom_rules(&self, source: &str, rules: &[CustomRule]) -> Vec<CustomRuleMatch> {
+        use regex::Regex;
+
+        let mut matches = Vec::new();
+        for rule in rules {
+            let re = match Regex::new(&rule.pattern) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for (line_no, line) in source.lines().enumerate() {
+                let line_num = line_no + 1;
+                if re.find(line).is_some() {
+                    matches.push(CustomRuleMatch {
+                        rule_name: rule.name.clone(),
+                        line: line_num,
+                        snippet: line.trim().to_string(),
+                    });
+                }
+            }
+        }
+        matches
+    }
+
     // ── Size estimation helpers ───────────────────────────────────────────────
 
     fn estimate_struct_size(&self, s: &syn::ItemStruct) -> usize {
@@ -478,47 +514,9 @@ impl<'ast> Visit<'ast> for UnsafeVisitor {
     }
 }
 
+/// Trait for runtime invariant checking. Implement to enforce contract invariants.
 pub trait SanctifiedGuard {
     fn check_invariant(&self, env: &Env) -> Result<(), String>;
-    fn visit_macro(&mut self, node: &'ast syn::Macro) {
-        if node.path.is_ident("panic") {
-            let line = node
-                .path
-                .get_ident()
-                .map(|i| i.span().start().line)
-                .unwrap_or(0);
-            self.patterns.push(UnsafePattern {
-                pattern_type: PatternType::Panic,
-                line,
-                snippet: "panic!()".to_string(),
-            });
-        }
-        visit::visit_macro(self, node);
-    }
-
-    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        let method = node.method.to_string();
-        match method.as_str() {
-            "unwrap" => {
-                let line = node.method.span().start().line;
-                self.patterns.push(UnsafePattern {
-                    pattern_type: PatternType::Unwrap,
-                    line,
-                    snippet: ".unwrap()".to_string(),
-                });
-            }
-            "expect" => {
-                let line = node.method.span().start().line;
-                self.patterns.push(UnsafePattern {
-                    pattern_type: PatternType::Expect,
-                    line,
-                    snippet: ".expect()".to_string(),
-                });
-            }
-            _ => {}
-        }
-        visit::visit_expr_method_call(self, node);
-    }
 }
 
 // ── ArithVisitor ──────────────────────────────────────────────────────────────
