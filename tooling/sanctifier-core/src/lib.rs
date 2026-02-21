@@ -4,6 +4,7 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{parse_str, Fields, File, Item, Meta, Type};
 use soroban_sdk::Env;
+use thiserror::Error;
 
 // ── Existing types ────────────────────────────────────────────────────────────
 
@@ -514,9 +515,21 @@ impl<'ast> Visit<'ast> for UnsafeVisitor {
     }
 }
 
-/// Trait for runtime invariant checking. Implement to enforce contract invariants.
+// ── SanctifiedGuard (runtime monitoring) ───────────────────────────────────────
+
+/// Error type for SanctifiedGuard runtime invariant violations.
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("invariant violation: {0}")]
+    InvariantViolation(String),
+}
+
+/// Trait for runtime monitoring. Implement this to enforce invariants
+/// on your contract state. The foundation for runtime monitoring.
 pub trait SanctifiedGuard {
-    fn check_invariant(&self, env: &Env) -> Result<(), String>;
+    /// Verifies that contract invariants hold in the current environment.
+    /// Returns `Ok(())` if all invariants hold, or `Err` with a violation message.
+    fn check_invariant(&self, env: &Env) -> Result<(), Error>;
 }
 
 // ── ArithVisitor ──────────────────────────────────────────────────────────────
@@ -897,3 +910,4 @@ mod tests {
         assert!(issues[0].location.starts_with("risky:"));
     }
 }
+pub mod gas_estimator;\npub mod gas_report;
