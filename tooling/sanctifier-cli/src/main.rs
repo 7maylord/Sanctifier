@@ -1,9 +1,8 @@
 use clap::{Parser, Subcommand};
 use colored::*;
-use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use sanctifier_core::{Analyzer, ArithmeticIssue, SizeWarning, UnsafePattern};
 use std::fs;
-
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "sanctifier")]
@@ -20,7 +19,7 @@ enum Commands {
         /// Path to the contract directory or Cargo.toml
         #[arg(default_value = ".")]
         path: PathBuf,
-        
+
         /// Output format (text, json)
         #[arg(short, long, default_value = "text")]
         format: String,
@@ -48,7 +47,11 @@ fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Analyze { path, format, limit } => {
+        Commands::Analyze {
+            path,
+            format,
+            limit,
+        } => {
             let is_json = format == "json";
 
             if !is_soroban_project(path) {
@@ -58,12 +61,24 @@ fn main() {
 
             // In JSON mode, send informational lines to stderr so stdout is clean JSON.
             if is_json {
-                eprintln!("{} Sanctifier: Valid Soroban project found at {:?}", "✨".green(), path);
+                eprintln!(
+                    "{} Sanctifier: Valid Soroban project found at {:?}",
+                    "✨".green(),
+                    path
+                );
                 eprintln!("{} Analyzing contract at {:?}...", "🔍".blue(), path);
             } else {
-                println!("{} Sanctifier: Valid Soroban project found at {:?}", "✨".green(), path);
+                println!(
+                    "{} Sanctifier: Valid Soroban project found at {:?}",
+                    "✨".green(),
+                    path
+                );
                 println!("{} Analyzing contract at {:?}...", "🔍".blue(), path);
             }
+
+            let mut analyzer = Analyzer::new(false);
+            analyzer.ledger_limit = *limit;
+
             
 
             
@@ -79,6 +94,15 @@ fn main() {
             let mut all_custom_rule_matches: Vec<CustomRuleMatch> = Vec::new();
 
             if path.is_dir() {
+                analyze_directory(
+                    path,
+                    &analyzer,
+                    &mut all_size_warnings,
+                    &mut all_unsafe_patterns,
+                    &mut all_auth_gaps,
+                    &mut all_panic_issues,
+                    &mut all_arithmetic_issues,
+                );
                 analyze_directory(path, &analyzer, &config.rules, &mut all_size_warnings, &mut all_unsafe_patterns, &mut all_auth_gaps, &mut all_panic_issues, &mut all_arithmetic_issues, &mut all_custom_rule_matches);
             } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
                 if let Ok(content) = fs::read_to_string(path) {
@@ -118,7 +142,7 @@ fn main() {
             } else {
                 println!("{} Static analysis complete.", "✅".green());
             }
-            
+
             if format == "json" {
                 let output = serde_json::json!({
                     "size_warnings": all_size_warnings,
@@ -128,8 +152,15 @@ fn main() {
                     "arithmetic_issues": all_arithmetic_issues,
                     "custom_rule_matches": all_custom_rule_matches,
                 });
-                println!("{}", serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string()));
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
+                );
             } else {
+                if all_size_warnings.is_empty() {
+                    println!("No ledger size issues found.");
+                } else {
+                    for warning in all_size_warnings {
 
                         println!(
                             "   {} Warning: Struct {} is approaching ledger entry size limit!",
@@ -149,7 +180,11 @@ fn main() {
                 if !all_auth_gaps.is_empty() {
                     println!("\n{} Found potential Authentication Gaps!", "🛑".red());
                     for gap in all_auth_gaps {
-                        println!("   {} Function {} is modifying state without require_auth()", "->".red(), gap.bold());
+                        println!(
+                            "   {} Function {} is modifying state without require_auth()",
+                            "->".red(),
+                            gap.bold()
+                        );
                     }
                 } else {
                     println!("\nNo authentication gaps found.");
@@ -211,7 +246,7 @@ fn main() {
             } else {
                 println!("Report printed to stdout.");
             }
-        },
+        }
         Commands::Init => {
 
             }
@@ -268,6 +303,28 @@ fn analyze_directory(
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                analyze_directory(
+                    &path,
+                    analyzer,
+                    all_size_warnings,
+                    all_unsafe_patterns,
+                    all_auth_gaps,
+                    all_panic_issues,
+                    all_arithmetic_issues,
+                );
+            } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    let warnings = analyzer.analyze_ledger_size(&content);
+                    for mut w in warnings {
+                        w.struct_name = format!("{}: {}", path.display(), w.struct_name);
+                        all_size_warnings.push(w);
+                    }
+
+                    let patterns = analyzer.analyze_unsafe_patterns(&content);
+                    for mut p in patterns {
+                        p.snippet = format!("{}: {}", path.display(), p.snippet);
+                        all_unsafe_patterns.push(p);
+                    }
                 analyze_directory(&path, analyzer, rules, all_size_warnings, all_unsafe_patterns, all_auth_gaps, all_panic_issues, all_arithmetic_issues, all_custom_rule_matches);
             } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
                 if let Ok(content) = fs::read_to_string(&path) {
