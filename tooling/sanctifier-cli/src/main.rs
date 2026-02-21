@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use colored::*;
 use std::path::{Path, PathBuf};
 use std::fs;
-use sanctifier_core::{Analyzer, Finding};
+use sanctifier_core::{Analyzer, ArithmeticIssue, SizeWarning, UnsafePattern, PatternType};
 
 #[derive(Parser)]
 #[command(name = "sanctifier")]
@@ -62,16 +62,24 @@ fn main() {
             let mut analyzer = Analyzer::new(false);
             analyzer.ledger_limit = *limit;
             
-            let mut all_warnings = Vec::new();
-            let mut all_auth_gaps = Vec::new();
+            let mut all_size_warnings: Vec<SizeWarning> = Vec::new();
+            let mut all_unsafe_patterns: Vec<UnsafePattern> = Vec::new();
+            let mut all_auth_gaps: Vec<String> = Vec::new();
             let mut all_panic_issues = Vec::new();
+            let mut all_arithmetic_issues: Vec<ArithmeticIssue> = Vec::new();
 
             if path.is_dir() {
-                analyze_directory(path, &analyzer, &mut all_warnings, &mut all_auth_gaps, &mut all_panic_issues);
+                analyze_directory(path, &analyzer, &mut all_size_warnings, &mut all_unsafe_patterns, &mut all_auth_gaps, &mut all_panic_issues, &mut all_arithmetic_issues);
             } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
                 if let Ok(content) = fs::read_to_string(path) {
-                    all_warnings.extend(analyzer.analyze_ledger_size(&content));
-                    
+                    all_size_warnings.extend(analyzer.analyze_ledger_size(&content));
+
+                    let patterns = analyzer.analyze_unsafe_patterns(&content);
+                    for mut p in patterns {
+                        p.snippet = format!("{}: {}", path.display(), p.snippet);
+                        all_unsafe_patterns.push(p);
+                    }
+
                     let gaps = analyzer.scan_auth_gaps(&content);
                     for g in gaps {
                         all_auth_gaps.push(format!("{}: {}", path.display(), g));
@@ -83,6 +91,12 @@ fn main() {
                         p_mod.location = format!("{}: {}", path.display(), p.location);
                         all_panic_issues.push(p_mod);
                     }
+
+                    let arith = analyzer.scan_arithmetic_overflow(&content);
+                    for mut a in arith {
+                        a.location = format!("{}: {}", path.display(), a.location);
+                        all_arithmetic_issues.push(a);
+                    }
                 }
             }
 
@@ -92,62 +106,15 @@ fn main() {
                 println!("{} Static analysis complete.", "✅".green());
             }
             
-            if is_json {
-                let mut findings: Vec<Finding> = Vec::new();
-
-                for w in &all_warnings {
-                    // struct_name is "file: StructName" when from analyze_directory
-                    let (file, struct_name) = match w.struct_name.split_once(": ") {
-                        Some((f, s)) => (f.to_string(), s.to_string()),
-                        None => (String::new(), w.struct_name.clone()),
-                    };
-                    findings.push(Finding {
-                        severity: "warning".to_string(),
-                        file,
-                        line: 0,
-                        message: format!(
-                            "Struct '{}' approaching ledger entry size limit: estimated {} bytes (limit: {} bytes)",
-                            struct_name, w.estimated_size, w.limit
-                        ),
-                    });
-                }
-
-                for gap in &all_auth_gaps {
-                    // gap is "file: function_name"
-                    let (file, func) = match gap.split_once(": ") {
-                        Some((f, s)) => (f.to_string(), s.to_string()),
-                        None => (String::new(), gap.clone()),
-                    };
-                    findings.push(Finding {
-                        severity: "error".to_string(),
-                        file,
-                        line: 0,
-                        message: format!(
-                            "Function '{}' modifies state without require_auth()",
-                            func
-                        ),
-                    });
-                }
-
-                for issue in &all_panic_issues {
-                    // location is "file: function_name"
-                    let (file, _) = match issue.location.split_once(": ") {
-                        Some((f, s)) => (f.to_string(), s.to_string()),
-                        None => (String::new(), issue.location.clone()),
-                    };
-                    findings.push(Finding {
-                        severity: "warning".to_string(),
-                        file,
-                        line: 0,
-                        message: format!(
-                            "Function '{}' uses '{}' — prefer returning Result or Error types",
-                            issue.function_name, issue.issue_type
-                        ),
-                    });
-                }
-
-                let json = serde_json::to_string_pretty(&findings).unwrap_or_else(|_| "[]".to_string());
-                println!("{}", json);
+            if format == "json" {
+                let output = serde_json::json!({
+                    "size_warnings": all_size_warnings,
+                    "unsafe_patterns": all_unsafe_patterns,
+                    "auth_gaps": all_auth_gaps,
+                    "panic_issues": all_panic_issues,
+                    "arithmetic_issues": all_arithmetic_issues,
+                });
+                println!("{}", serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string()));
             } else {
                 if all_warnings.is_empty() {
                     println!("No ledger size issues found.");
@@ -189,6 +156,22 @@ fn main() {
                     println!("   {} Tip: Prefer returning Result or Error types for better contract safety.", "💡".blue());
                 } else {
                     println!("\nNo panic/unwrap issues found.");
+                }
+
+                if !all_arithmetic_issues.is_empty() {
+                    println!("\n{} Found unchecked Arithmetic Operations!", "🔢".yellow());
+                    for issue in all_arithmetic_issues {
+                        println!(
+                            "   {} Function {}: Unchecked `{}` ({})",
+                            "->".red(),
+                            issue.function_name.bold(),
+                            issue.operation.yellow().bold(),
+                            issue.location
+                        );
+                        println!("      {} {}", "💡".blue(), issue.suggestion);
+                    }
+                } else {
+                    println!("\nNo arithmetic overflow risks found.");
                 }
             }
         },
@@ -242,17 +225,19 @@ fn is_soroban_project(path: &Path) -> bool {
 }
 
 fn analyze_directory(
-    dir: &Path, 
-    analyzer: &Analyzer, 
-    all_warnings: &mut Vec<sanctifier_core::SizeWarning>, 
+    dir: &Path,
+    analyzer: &Analyzer,
+    all_size_warnings: &mut Vec<SizeWarning>,
+    all_unsafe_patterns: &mut Vec<UnsafePattern>,
     all_auth_gaps: &mut Vec<String>,
-    all_panic_issues: &mut Vec<sanctifier_core::PanicIssue>
+    all_panic_issues: &mut Vec<sanctifier_core::PanicIssue>,
+    all_arithmetic_issues: &mut Vec<ArithmeticIssue>,
 ) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                analyze_directory(&path, analyzer, all_warnings, all_auth_gaps, all_panic_issues);
+                analyze_directory(&path, analyzer, all_size_warnings, all_unsafe_patterns, all_auth_gaps, all_panic_issues, all_arithmetic_issues);
             } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
                 if let Ok(content) = fs::read_to_string(&path) {
                     let warnings = analyzer.analyze_ledger_size(&content);
@@ -271,6 +256,12 @@ fn analyze_directory(
                         let mut p_mod = p.clone();
                         p_mod.location = format!("{}: {}", path.display(), p.location);
                         all_panic_issues.push(p_mod);
+                    }
+
+                    let arith = analyzer.scan_arithmetic_overflow(&content);
+                    for mut a in arith {
+                        a.location = format!("{}: {}", path.display(), a.location);
+                        all_arithmetic_issues.push(a);
                     }
                 }
             }
