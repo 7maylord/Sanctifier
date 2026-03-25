@@ -1,5 +1,6 @@
 #![allow(deprecated)]
 use assert_cmd::Command;
+use mockito::Server;
 use std::env;
 use std::fs;
 use tempfile::tempdir;
@@ -181,4 +182,67 @@ fn test_init_overwrites_when_force_is_set() {
     let content = fs::read_to_string(&config_path).unwrap();
     assert_ne!(content, "existing content");
     assert!(content.contains("ignore_paths"));
+}
+
+#[test]
+fn test_webhook_failure_is_non_fatal() {
+    let mut server = Server::new();
+    let mock = server.mock("POST", "/notify").with_status(500).create();
+
+    let fixture_path = env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/valid_contract.rs");
+    let webhook_url = format!("{}/notify?sanctifier_provider=discord", server.url());
+
+    let mut cmd = Command::cargo_bin("sanctifier").unwrap();
+    cmd.arg("analyze")
+        .arg(fixture_path)
+        .arg("--webhook-url")
+        .arg(webhook_url)
+        .env_remove("RUST_LOG")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Static analysis complete."))
+        .stderr(predicates::str::contains("Webhook delivery failed"));
+
+    mock.assert();
+}
+
+#[test]
+fn test_callgraph_generates_dot_for_invoke_contract_calls() {
+    let temp_dir = tempdir().unwrap();
+    let contract_path = temp_dir.path().join("router.rs");
+    let dot_path = temp_dir.path().join("callgraph.dot");
+
+    fs::write(
+        &contract_path,
+        r#"
+            use soroban_sdk::{contract, contractimpl, Address, Env, Symbol};
+
+            #[contract]
+            pub struct Router;
+
+            #[contractimpl]
+            impl Router {
+                pub fn forward(env: Env, target: Address, to: Address, amount: i128) {
+                    let fn_name = Symbol::new(&env, "transfer");
+                    env.invoke_contract::<()>(target, &fn_name, (&to, &amount));
+                }
+            }
+        "#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("sanctifier").unwrap();
+    cmd.arg("callgraph")
+        .arg(&contract_path)
+        .arg("--output")
+        .arg(&dot_path)
+        .assert()
+        .success();
+
+    let dot = fs::read_to_string(&dot_path).unwrap();
+    assert!(dot.contains("digraph ContractCallGraph"));
+    assert!(dot.contains("\"Router\" -> \"target\""));
+    assert!(dot.contains("fn_name"));
 }
